@@ -248,6 +248,126 @@ impl NetworkSettings {
     }
 }
 
+/// 自动下单使用的付款方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutPayment {
+    #[default]
+    Alipay,
+    Wechat,
+    /// 银行或平台分期，具体方案由 `installment_bank` 与 `installment_periods` 决定。
+    Installment,
+}
+
+/// Apple 结账页提供的分期期数。
+pub const INSTALLMENT_PERIODS: [u8; 5] = [1, 3, 6, 12, 24];
+
+/// 自动结账目前只支持中国大陆的结账页，其他地区的页面结构没有验证过。
+pub const CHECKOUT_LOCALE: &str = "zh_CN";
+
+/// 自动结账用来区分「是不是同一件商品」的标识。
+///
+/// 同一件商品可以在多家门店各有一条监控项，它们的标识相同。Watch 的表壳要搭配
+/// 表带，所以搭配件也算进去。前端按同样的规则拼这个字符串，两边必须一致。
+pub fn checkout_product_key(target: &Target) -> String {
+    format!(
+        "{}|{}|{}",
+        target.part_number,
+        target.companion_part.as_deref().unwrap_or_default(),
+        target.kit_part.as_deref().unwrap_or_default()
+    )
+}
+
+/// 到货后自动结账的设置。目前只支持中国大陆的直营店取货。
+///
+/// 默认整体关闭；即使开启，也默认停在「查看订单」页由用户自己点「立即下单」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CheckoutSettings {
+    pub enabled: bool,
+    /// 取货人证件号码后四位。Apple 每次结账都要求重新填写，不会预填。
+    pub national_id_suffix: String,
+    pub payment: CheckoutPayment,
+    /// 分期方案名称，按结账页上的名称匹配，例如「招商银行」「花呗分期」。
+    pub installment_bank: String,
+    pub installment_periods: u8,
+    /// 核对通过后是否自动点「立即下单」。付款始终由用户自己完成。
+    pub place_order: bool,
+    /// 结账页默认选中的门店（离取货地区最近的有货门店）可取货时，直接在那里取货，
+    /// 即使它不是监控到货的那一家。换门店要多等 Apple 一轮加载，约十几秒。
+    pub accept_nearest_store: bool,
+    /// 要下单的商品（[`checkout_product_key`]）。只有它到货才会触发结账，购物袋里
+    /// 放的也必须是它。留空且监控列表里只有一件商品时，自动认定为那一件。
+    pub product: String,
+    /// 是否用下面这组联系信息覆盖结账页上 Apple 预填的内容。关闭时只核对预填内容。
+    pub fill_contact: bool,
+    /// 取货人姓名须与取货时出示的证件一致。留空的项不填，沿用页面上已有的值。
+    pub contact_last_name: String,
+    pub contact_first_name: String,
+    pub contact_email: String,
+    /// 中国大陆手机号，不带 +86。
+    pub contact_phone: String,
+}
+
+impl Default for CheckoutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            national_id_suffix: String::new(),
+            payment: CheckoutPayment::Alipay,
+            installment_bank: "招商银行".into(),
+            installment_periods: 24,
+            place_order: false,
+            accept_nearest_store: false,
+            product: String::new(),
+            fill_contact: false,
+            contact_last_name: String::new(),
+            contact_first_name: String::new(),
+            contact_email: String::new(),
+            contact_phone: String::new(),
+        }
+    }
+}
+
+impl CheckoutSettings {
+    fn normalize(&mut self) {
+        // 身份证末位可能是 X；港澳台通行证与护照号也只含字母数字。
+        self.national_id_suffix = self
+            .national_id_suffix
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_uppercase())
+            .take(4)
+            .collect();
+        self.installment_bank = self.installment_bank.trim().to_string();
+        self.contact_last_name = self.contact_last_name.trim().to_string();
+        self.contact_first_name = self.contact_first_name.trim().to_string();
+        self.contact_email = self.contact_email.trim().to_string();
+        // 结账页的区号是固定的 +86，输入框里只要号码本身。
+        let digits: String = self
+            .contact_phone
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        self.contact_phone = match digits.strip_prefix("86") {
+            Some(rest) if rest.len() == 11 => rest.to_string(),
+            _ => digits,
+        };
+        if !INSTALLMENT_PERIODS.contains(&self.installment_periods) {
+            self.installment_periods = 24;
+        }
+        // 花呗分期最多 12 期，结账页上没有 24 期这个选项。
+        if self.installment_bank == "花呗分期" && self.installment_periods > 12 {
+            self.installment_periods = 12;
+        }
+    }
+
+    /// 证件后四位是否已填完整。没填完时自动结账必然卡在取货信息页。
+    pub fn has_national_id_suffix(&self) -> bool {
+        self.national_id_suffix.chars().count() == 4
+    }
+}
+
 /// 持久化的用户设置。
 ///
 /// 字段名跨 IPC 边界要和前端对齐，所以统一小驼峰，与 [`Target`]、
@@ -276,8 +396,13 @@ pub struct Settings {
     /// 有货时自动打开的页面；旧字段 `openBagOnHit` 通过别名兼容。
     #[serde(alias = "openBagOnHit")]
     pub open_on_hit: OpenOnHit,
+    /// 监控到任意一条有货后是否暂停监控。关闭时只要持续有货，每一轮都会重新提醒
+    /// （并重新触发自动结账）。
+    pub stop_on_hit: bool,
     /// Apple 查询的出口线路。
     pub network: NetworkSettings,
+    /// 到货后自动结账。
+    pub checkout: CheckoutSettings,
 }
 
 /// 内置地区表里的第一个 locale，作为兜底取值。
@@ -298,7 +423,9 @@ impl Default for Settings {
             product_bark_urls: BTreeMap::new(),
             sound_enabled: true,
             open_on_hit: OpenOnHit::Bag,
+            stop_on_hit: false,
             network: NetworkSettings::default(),
+            checkout: CheckoutSettings::default(),
         }
     }
 }
@@ -366,6 +493,52 @@ impl Settings {
         });
 
         self.network.normalize();
+        self.checkout.normalize();
+        // 选中的商品不在监控列表里了就清掉；没有明确的下单商品时自动结账不能开着，
+        // 否则会变成「哪件先到货就拿哪件去撞购物袋」。
+        if !self.checkout.product.is_empty()
+            && !self.checkout_candidates().contains(&self.checkout.product)
+        {
+            self.checkout.product.clear();
+            // 选定的商品没了就整体停用，不让剩下的某一件悄悄顶替它继续自动下单。
+            self.checkout.enabled = false;
+        }
+        if self.checkout_product().is_none() {
+            self.checkout.enabled = false;
+        }
+    }
+
+    /// 监控列表里可以自动结账的不同商品，按出现顺序排列。
+    fn checkout_candidates(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for target in &self.targets {
+            if target.locale != CHECKOUT_LOCALE {
+                continue;
+            }
+            let key = checkout_product_key(target);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// 自动结账要下单的商品：用户选中的那件；没选但监控列表里只有一件时就是它。
+    pub fn checkout_product(&self) -> Option<String> {
+        let mut candidates = self.checkout_candidates();
+        if candidates.contains(&self.checkout.product) {
+            return Some(self.checkout.product.clone());
+        }
+        if candidates.len() == 1 {
+            return candidates.pop();
+        }
+        None
+    }
+
+    /// 这条监控项到货时是否应当触发自动结账。
+    pub fn is_checkout_target(&self, target: &Target) -> bool {
+        target.locale == CHECKOUT_LOCALE
+            && self.checkout_product().as_deref() == Some(checkout_product_key(target).as_str())
     }
 
     /// 查询间隔。
@@ -786,7 +959,9 @@ impl LegacySettings {
                 Some(false) => OpenOnHit::None,
                 None => fallback.open_on_hit,
             },
+            stop_on_hit: fallback.stop_on_hit,
             network: fallback.network,
+            checkout: fallback.checkout,
         };
         settings.normalize();
         settings

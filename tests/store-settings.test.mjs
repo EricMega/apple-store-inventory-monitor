@@ -25,11 +25,16 @@ registerHooks({
 const defaults = {
   locale: "zh_CN", targets: [], intervalSeconds: 30,
   deliveryRegion: null,
-  barkUrl: "https://example.invalid/old", soundEnabled: true, openOnHit: "bag",
+  barkUrl: "https://example.invalid/old", soundEnabled: true, openOnHit: "bag", stopOnHit: false,
   productBarkUrls: {},
   network: {
     mode: "system",
     clash: { controller: "http://127.0.0.1:9097", secret: "", group: "果到雷达", proxyPort: 7899, nodeFilter: "", pinnedNode: "DIRECT" },
+  },
+  checkout: {
+    enabled: false, nationalIdSuffix: "", payment: "alipay",
+    installmentBank: "招商银行", installmentPeriods: 24, placeOrder: false, acceptNearestStore: false, product: "",
+    fillContact: false, contactLastName: "", contactFirstName: "", contactEmail: "", contactPhone: "",
   },
 };
 let generation = 0;

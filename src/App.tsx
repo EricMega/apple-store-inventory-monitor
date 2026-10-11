@@ -21,6 +21,7 @@ import {
   SquareTerminal,
   Trash2,
   Truck,
+  CirclePause,
   Volume2,
   X,
 } from "lucide-react";
@@ -29,6 +30,7 @@ import { describeUpdateProgress, updatePercent } from "@/lib/updateStatus";
 import { Combobox } from "@/components/Combobox";
 import { MultiCombobox } from "@/components/MultiCombobox";
 import { CollapsiblePanel } from "@/components/CollapsiblePanel";
+import { CheckoutSettings } from "@/components/CheckoutSettings";
 import { NetworkSettings } from "@/components/NetworkSettings";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -1345,12 +1347,30 @@ export default function App() {
                       </SelectContent>
                     </Select>
                   </div>
+                  <div className="setting-row">
+                    <Label htmlFor="stop-on-hit" className="flex items-center gap-2 text-sm font-normal">
+                      <CirclePause className="size-4 text-muted-foreground" aria-hidden="true" />到货后暂停监控
+                    </Label>
+                    <Switch
+                      id="stop-on-hit"
+                      aria-label="到货后暂停监控"
+                      checked={ui.settings.stopOnHit}
+                      onCheckedChange={(value) => void saveSettings({ stopOnHit: value })}
+                    />
+                  </div>
                 </div>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  {ui.settings.stopOnHit
+                    ? "任意一条监控到有货后暂停监控，提醒和自动结账只执行这一轮，需要时再手动开始。"
+                    : "持续有货时，每一轮查询都会重新提醒；开启了自动结账且上一次没有成功时，也会再次尝试。"}
+                </p>
 
                 <Button variant="outline" className="mt-3 h-10 w-full rounded-xl border-border/70 bg-background/30" onClick={() => void testNotify()}>
                   <BellRing aria-hidden="true" /> 测试提醒与跳转
                 </Button>
               </CollapsiblePanel>
+
+              <CheckoutSettings checkout={ui.settings.checkout} targets={ui.settings.targets} />
 
               <NetworkSettings network={ui.settings.network} running={ui.running} route={ui.route} />
 

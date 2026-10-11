@@ -69,7 +69,7 @@ impl Drop for ChromiumProcess {
 }
 
 #[derive(Debug)]
-struct ChromiumSession {
+pub(crate) struct ChromiumSession {
     /// 必须放在会话建立的最早阶段。DevTools 连接前任一错误返回，都要回收进程树。
     _process: ChromiumProcess,
     profile_dir: PathBuf,
@@ -116,10 +116,15 @@ fn reserve_loopback_port() -> Result<u16, ApiError> {
 }
 
 fn chromium_profile_dir() -> PathBuf {
+    app_profile_dir(CHROMIUM_PROFILE_DIR)
+}
+
+/// 应用专属的 Chromium 资料目录。查询与结账各用一个，互不共享 Cookie。
+pub(crate) fn app_profile_dir(name: &str) -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("apple-store-inventory-monitor")
-        .join(CHROMIUM_PROFILE_DIR)
+        .join(name)
 }
 
 #[cfg(unix)]
@@ -402,6 +407,21 @@ impl ChromiumSession {
         profile_dir: PathBuf,
         network_args: &[String],
     ) -> Result<Self, ApiError> {
+        Self::launch(profile_dir, network_args, true).await
+    }
+
+    /// 启动带窗口的会话，供用户登录并观察自动结账。
+    ///
+    /// 不覆盖 UA 和屏幕参数：有窗口的浏览器本身就是真实环境，覆盖反而制造不一致。
+    pub(crate) async fn start_visible(profile_dir: PathBuf) -> Result<Self, ApiError> {
+        Self::launch(profile_dir, &[], false).await
+    }
+
+    async fn launch(
+        profile_dir: PathBuf,
+        network_args: &[String],
+        headless: bool,
+    ) -> Result<Self, ApiError> {
         let chrome = find_chromium().ok_or_else(|| {
             ApiError::Transport(
                 "未找到 Google Chrome 或 Microsoft Edge；Apple 当前库存接口要求完整 Chromium 浏览器会话"
@@ -423,8 +443,9 @@ impl ChromiumSession {
         let debug_port = reserve_loopback_port()?;
         let debug_port_arg = format!("--remote-debugging-port={debug_port}");
         eprintln!(
-            "正在启动 Apple 专属 Chromium 会话：profile={}，mode=headless",
-            profile_dir.display()
+            "正在启动 Apple 专属 Chromium 会话：profile={}，mode={}",
+            profile_dir.display(),
+            if headless { "headless" } else { "visible" }
         );
         let mut command = Command::new(chrome);
         command
@@ -442,12 +463,14 @@ impl ChromiumSession {
             .stderr(Stdio::null());
         // 无头模式：不出现窗口和 Dock 图标，也不会抢焦点。无头浏览器的破绽由
         // 启动后的 UA 与 Client Hints 覆盖补上，见 `apply_browser_identity`。
-        command.args([
-            "--headless=new",
-            // 无头默认 800×600，是常见的自动化特征；换成常见的笔记本分辨率。
-            "--window-size=1440,900",
-            "--disable-blink-features=AutomationControlled",
-        ]);
+        if headless {
+            command.args([
+                "--headless=new",
+                // 无头默认 800×600，是常见的自动化特征；换成常见的笔记本分辨率。
+                "--window-size=1440,900",
+                "--disable-blink-features=AutomationControlled",
+            ]);
+        }
         command.args(network_args);
         command.arg("about:blank");
         #[cfg(unix)]
@@ -511,6 +534,9 @@ impl ChromiumSession {
             locale: None,
             established,
         };
+        if !headless {
+            return Ok(session);
+        }
         let version = session.command("Browser.getVersion", json!({})).await?;
         let identity = BrowserIdentity::from_version(&version, is_edge)
             .ok_or_else(|| ApiError::Transport("无法读取 Chromium 版本信息".into()))?;
@@ -541,7 +567,7 @@ impl ChromiumSession {
         }
     }
 
-    async fn command(&mut self, method: &str, params: Value) -> Result<Value, ApiError> {
+    pub(crate) async fn command(&mut self, method: &str, params: Value) -> Result<Value, ApiError> {
         let id = self.next_command_id;
         self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
         let request = json!({ "id": id, "method": method, "params": params });
@@ -580,7 +606,11 @@ impl ChromiumSession {
             .map_err(|_| ApiError::Transport(format!("Chromium 命令 {method} 超时")))?
     }
 
-    async fn evaluate(&mut self, expression: &str, await_promise: bool) -> Result<Value, ApiError> {
+    pub(crate) async fn evaluate(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<Value, ApiError> {
         let result = self
             .command(
                 "Runtime.evaluate",
