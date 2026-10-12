@@ -19,7 +19,7 @@ use apw_core::watcher::{Event, TargetState, Watcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
 
 mod checkout;
@@ -35,6 +35,9 @@ const EVENT_CHANNEL: &str = "watcher://event";
 const NOTICE_CHANNEL: &str = "watcher://notice";
 /// 后端自己改了设置（例如结账完成后关闭自动结账）时，把新设置推给界面。
 const SETTINGS_CHANNEL: &str = "watcher://settings";
+/// 退出时等待浏览器收尾的上限。正在进行的查询或结账可能占着会话不放，
+/// 不能让退出一直卡住；超时后残留的进程由下次启动回收。
+const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 地区的可序列化形式。
 ///
@@ -1315,15 +1318,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "quit" => {
                 // `app.exit()` 会立即结束事件循环，不能指望托管状态的析构顺序替
                 // Chromium 收尾。先停掉可能正在查询的一轮，再显式释放浏览器树。
-                let state = app.state::<AppState>();
-                let watcher = state.watcher.clone();
-                let fetcher = state.fetcher.clone();
-                let checkout = state.checkout.clone();
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    watcher.stop().await;
-                    fetcher.shutdown().await;
-                    checkout.shutdown().await;
+                    release_browsers(&app).await;
                     app.exit(0);
                 });
             }
@@ -1538,8 +1535,29 @@ pub fn run() {
             check_for_update,
             install_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("Tauri 应用启动失败")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                // Dock 图标的「退出」、Cmd+Q 和应用菜单的退出都不经过托盘菜单，
+                // 系统直接结束进程。这里是所有退出方式的最后一站：不在这里收尾，
+                // 查询用的无头浏览器和下单浏览器都会留在后台。托盘退出已经清理
+                // 过一遍，再走到这里时两个会话都是空的，立即返回。
+                tauri::async_runtime::block_on(async {
+                    let _ = tokio::time::timeout(EXIT_CLEANUP_TIMEOUT, release_browsers(app)).await;
+                });
+            }
+        });
+}
+
+/// 停掉监控并关闭查询与下单两个浏览器。可以重复调用。
+async fn release_browsers(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    state.watcher.stop().await;
+    state.fetcher.shutdown().await;
+    state.checkout.shutdown().await;
 }
 
 #[cfg(test)]
