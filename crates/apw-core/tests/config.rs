@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 use apw_core::config::{
-    ClashSettings, ConfigError, DEFAULT_INTERVAL_SECONDS, MAX_SETTINGS_BYTES, NetworkMode,
-    NetworkSettings, OpenOnHit, Settings, SettingsStore,
+    CheckoutPayment, CheckoutSettings, ClashSettings, ConfigError, DEFAULT_INTERVAL_SECONDS,
+    MAX_SETTINGS_BYTES, NetworkMode, NetworkSettings, OpenOnHit, Settings, SettingsStore,
 };
 use apw_core::model::Target;
 
@@ -99,6 +99,7 @@ fn 样例设置() -> Settings {
             .collect(),
         sound_enabled: false,
         open_on_hit: OpenOnHit::Product,
+        stop_on_hit: true,
         network: NetworkSettings {
             mode: NetworkMode::Clash,
             clash: ClashSettings {
@@ -109,6 +110,21 @@ fn 样例设置() -> Settings {
                 node_filter: "香港|日本".into(),
                 pinned_node: "DIRECT".into(),
             },
+        },
+        checkout: CheckoutSettings {
+            enabled: true,
+            national_id_suffix: "123X".into(),
+            payment: CheckoutPayment::Installment,
+            installment_bank: "招商银行".into(),
+            installment_periods: 24,
+            place_order: false,
+            accept_nearest_store: true,
+            product: "MG724CH/A||".into(),
+            fill_contact: true,
+            contact_last_name: "张".into(),
+            contact_first_name: "三".into(),
+            contact_email: "someone@example.com".into(),
+            contact_phone: "13800000000".into(),
         },
     }
 }
@@ -572,14 +588,16 @@ fn 设置的线上格式是小驼峰() {
         "productBarkUrls",
         "soundEnabled",
         "openOnHit",
+        "stopOnHit",
         "network",
+        "checkout",
     ] {
         assert!(obj.contains_key(key), "缺少字段 {key}：{value}");
     }
     assert!(!obj.contains_key("interval_seconds"), "不该有蛇形字段");
     assert_eq!(obj.get("openOnHit"), Some(&serde_json::json!("product")));
     assert!(!obj.contains_key("openBagOnHit"));
-    assert_eq!(obj.len(), 9);
+    assert_eq!(obj.len(), 11);
     assert_eq!(
         obj.get("network"),
         Some(&serde_json::json!({
@@ -708,4 +726,126 @@ fn 控制接口地址缺少协议时自动补上_http() {
         settings.network.clash.controller,
         "https://example.invalid:9090"
     );
+}
+
+#[test]
+fn 自动结账默认关闭且不会自动提交订单() {
+    let checkout = Settings::default().checkout;
+    let mut huabei = Settings::default();
+    huabei.checkout.installment_bank = "花呗分期".into();
+    huabei.checkout.installment_periods = 24;
+    huabei.normalize();
+    assert_eq!(huabei.checkout.installment_periods, 12);
+    assert!(!checkout.enabled);
+    assert!(!checkout.place_order);
+    assert!(!checkout.accept_nearest_store);
+    assert!(!checkout.fill_contact);
+    assert!(!checkout.has_national_id_suffix());
+}
+
+#[test]
+fn 自动结账规范化只保留四位证件后缀并收敛期数() {
+    let mut settings = Settings::default();
+    settings.checkout.national_id_suffix = " 12-3x9 ".into();
+    settings.checkout.installment_bank = " 招商银行 ".into();
+    settings.checkout.installment_periods = 5;
+    settings.checkout.contact_last_name = " 张 ".into();
+    settings.checkout.contact_email = " someone@example.com ".into();
+    settings.checkout.contact_phone = "+86 138-0000-0000".into();
+    settings.normalize();
+
+    assert_eq!(settings.checkout.national_id_suffix, "123X");
+    assert!(settings.checkout.has_national_id_suffix());
+    assert_eq!(settings.checkout.installment_bank, "招商银行");
+    assert_eq!(settings.checkout.installment_periods, 24);
+    assert_eq!(settings.checkout.contact_last_name, "张");
+    assert_eq!(settings.checkout.contact_email, "someone@example.com");
+    assert_eq!(settings.checkout.contact_phone, "13800000000");
+}
+
+#[test]
+fn 旧配置缺少自动结账字段时保持关闭() {
+    let settings: Settings = serde_json::from_str(r#"{"locale":"zh_CN"}"#).expect("解析失败");
+    assert_eq!(settings.checkout, CheckoutSettings::default());
+}
+
+#[test]
+fn 只监控一件商品时自动认定它为下单商品() {
+    let mut settings = Settings {
+        targets: vec![目标("R683", "MG724CH/A"), 目标("R448", "MG724CH/A")],
+        ..Default::default()
+    };
+    // 同一件商品在两家门店各有一条监控项，仍然只算一件。
+    settings.checkout.enabled = true;
+    settings.normalize();
+    assert_eq!(settings.checkout_product().as_deref(), Some("MG724CH/A||"));
+    assert!(settings.checkout.enabled);
+    assert!(settings.is_checkout_target(&settings.targets[1]));
+}
+
+#[test]
+fn 监控多件商品时只有选中的那件会触发结账() {
+    let mut settings = Settings {
+        targets: vec![目标("R683", "MG724CH/A"), 目标("R683", "MG0A4CH/A")],
+        ..Default::default()
+    };
+    settings.checkout.enabled = true;
+    settings.checkout.product = "MG0A4CH/A||".into();
+    settings.normalize();
+    assert!(settings.checkout.enabled);
+    assert!(!settings.is_checkout_target(&settings.targets[0]));
+    assert!(settings.is_checkout_target(&settings.targets[1]));
+}
+
+#[test]
+fn 没有明确的下单商品时自动结账会被关掉() {
+    // 监控了两件却没选。
+    let mut settings = Settings {
+        targets: vec![目标("R683", "MG724CH/A"), 目标("R683", "MG0A4CH/A")],
+        ..Default::default()
+    };
+    settings.checkout.enabled = true;
+    settings.normalize();
+    assert_eq!(settings.checkout_product(), None);
+    assert!(!settings.checkout.enabled);
+    assert!(!settings.is_checkout_target(&settings.targets[0]));
+
+    // 选中的那件被从监控列表里删掉：选择清空；剩下唯一的一件不会被悄悄顶替成下单商品后继续开着。
+    let mut settings = Settings {
+        targets: vec![
+            目标("R683", "MG724CH/A"),
+            目标("R683", "MG0A4CH/A"),
+            目标("R683", "MG0B4CH/A"),
+        ],
+        ..Default::default()
+    };
+    settings.checkout.enabled = true;
+    settings.checkout.product = "MG724CH/A||".into();
+    settings.targets.remove(0);
+    settings.normalize();
+    assert!(settings.checkout.product.is_empty());
+    assert!(!settings.checkout.enabled);
+
+    // 删到只剩一件也一样：不能因为「只剩一件」就自动改成为它下单。
+    let mut settings = Settings {
+        targets: vec![目标("R683", "MG724CH/A"), 目标("R683", "MG0A4CH/A")],
+        ..Default::default()
+    };
+    settings.checkout.enabled = true;
+    settings.checkout.product = "MG724CH/A||".into();
+    settings.targets.remove(0);
+    settings.normalize();
+    assert!(!settings.checkout.enabled);
+}
+
+#[test]
+fn 其他地区的监控项不会触发自动结账() {
+    let mut settings = Settings::default();
+    let mut abroad = 目标("R409", "MG724ZP/A");
+    abroad.locale = "zh_HK".into();
+    settings.targets = vec![abroad];
+    settings.checkout.enabled = true;
+    settings.normalize();
+    assert_eq!(settings.checkout_product(), None);
+    assert!(!settings.checkout.enabled);
 }

@@ -19,18 +19,25 @@ use apw_core::watcher::{Event, TargetState, Watcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
 
+mod checkout;
 mod chromium_fetcher;
 mod clash;
 mod route_pool;
+use checkout::{CheckoutOutcome, CheckoutPlan, CheckoutRunner};
 use chromium_fetcher::AppleChromiumFetcher;
 
 /// 前端事件通道名。前端用 `listen("watcher://event", ...)` 订阅。
 const EVENT_CHANNEL: &str = "watcher://event";
 /// 启动过程中的降级说明通道：配置读不出来之类的事必须让用户看见。
 const NOTICE_CHANNEL: &str = "watcher://notice";
+/// 后端自己改了设置（例如结账完成后关闭自动结账）时，把新设置推给界面。
+const SETTINGS_CHANNEL: &str = "watcher://settings";
+/// 退出时等待浏览器收尾的上限。正在进行的查询或结账可能占着会话不放，
+/// 不能让退出一直卡住；超时后残留的进程由下次启动回收。
+const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 地区的可序列化形式。
 ///
@@ -251,6 +258,7 @@ struct CategoryDto {
 struct AppState {
     watcher: Watcher,
     fetcher: AppleChromiumFetcher,
+    checkout: CheckoutRunner,
     catalog: Catalog,
     http: reqwest::Client,
     /// 设置的内存副本。有可用的持久化存储时，只在新设置成功落盘后更新。
@@ -1042,6 +1050,138 @@ fn in_stock_notification_body(target: &Target) -> String {
     body
 }
 
+/// 打开下单浏览器，供用户登录 Apple 账户、加购并手动走一次结账。
+#[tauri::command]
+async fn open_checkout_browser(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.checkout.open().await.map_err(|e| e.to_string())
+}
+
+/// 试跑自动结账，走到「查看订单」页为止，无论设置如何都不提交订单。
+#[tauri::command]
+async fn test_checkout(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state.settings_snapshot();
+    if !settings.checkout.has_national_id_suffix() {
+        return Err("请先填写取货人证件号码后四位".into());
+    }
+    let target = settings
+        .targets
+        .iter()
+        .find(|target| settings.is_checkout_target(target))
+        .ok_or("试跑需要先确定要下单的商品：监控列表里要有它的中国大陆监控项，有多件商品时请在自动结账里选一件")?;
+    let plan = CheckoutPlan::new(target, &settings, false);
+    let progress = move |message: String| {
+        let _ = app.emit(NOTICE_CHANNEL, message);
+    };
+    match state.checkout.run(&plan, &progress).await {
+        Ok(CheckoutOutcome::ReachedReview { store, total }) => Ok(format!(
+            "试跑完成：{store} {} 已到「查看订单」页（总计 {total}），没有提交订单。",
+            target.product_name
+        )),
+        Ok(CheckoutOutcome::OrderSubmitted { .. }) => {
+            Err("试跑不应提交订单，请立即在下单浏览器里检查".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 到货后执行自动结账，并把结果通知用户。
+///
+/// 无论停在「查看订单」页还是已提交订单，成功一次后都会关闭自动结账：再次到货
+/// 时重跑流程会打断用户正在看的页面，已下单时还会重复下单。
+async fn run_checkout_on_hit(app: AppHandle, target: Target) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let settings = state.settings_snapshot();
+    let bark_url = settings.bark_url_for(&target).to_owned();
+    if !settings.checkout.has_national_id_suffix() {
+        let _ = app.emit(
+            NOTICE_CHANNEL,
+            "自动结账未执行：还没有填写取货人证件号码后四位。",
+        );
+        return;
+    }
+    let plan = CheckoutPlan::new(&target, &settings, settings.checkout.place_order);
+    let progress = {
+        let app = app.clone();
+        move |message: String| {
+            let _ = app.emit(NOTICE_CHANNEL, message);
+        }
+    };
+    let (title, body) = match state.checkout.run(&plan, &progress).await {
+        Ok(outcome) => {
+            let mut next = state.settings_snapshot();
+            next.checkout.enabled = false;
+            match state.put_settings(next.clone()) {
+                Ok(()) => {
+                    let _ = app.emit(SETTINGS_CHANNEL, &next);
+                }
+                Err(err) => {
+                    let _ = app.emit(NOTICE_CHANNEL, format!("关闭自动结账开关失败：{err}"));
+                }
+            }
+            match outcome {
+                CheckoutOutcome::ReachedReview { store, total } => (
+                    "已到查看订单页",
+                    format!(
+                        "{store} {}，总计 {total}。请在下单浏览器里点「立即下单」并付款。",
+                        target.product_name
+                    ),
+                ),
+                CheckoutOutcome::OrderSubmitted {
+                    store,
+                    order_number: Some(order),
+                    total,
+                } => (
+                    "已提交订单，请尽快付款",
+                    format!(
+                        "{store} {}，总计 {total}，订单 {order}。请在下单浏览器里完成付款。",
+                        target.product_name
+                    ),
+                ),
+                CheckoutOutcome::OrderSubmitted {
+                    store,
+                    order_number: None,
+                    total,
+                } => (
+                    "已点立即下单，请确认结果",
+                    format!(
+                        "{store} {}，总计 {total}。页面上没有读到订单号，请在下单浏览器里确认订单是否成立。",
+                        target.product_name
+                    ),
+                ),
+            }
+        }
+        Err(error) => {
+            // 在「立即下单」这一步出错时，无法确定订单有没有生成。持续有货时下一轮
+            // 还会触发结账，所以先把开关关掉，绝不能在这种状态下再点一次。
+            if error.stage == checkout::Stage::PlaceOrder {
+                let mut next = state.settings_snapshot();
+                next.checkout.enabled = false;
+                if state.put_settings(next.clone()).is_ok() {
+                    let _ = app.emit(SETTINGS_CHANNEL, &next);
+                }
+                (
+                    "提交订单时出错，请确认结果",
+                    format!("{error}。订单可能已经生成，请在下单浏览器里确认。自动结账已关闭。"),
+                )
+            } else {
+                (
+                    "自动结账没有完成",
+                    format!("{error}。请在下单浏览器里手动继续。"),
+                )
+            }
+        }
+    };
+    let _ = app.emit(NOTICE_CHANNEL, format!("{title}：{body}"));
+    if let Err(err) = dispatch_notification(&app, Notification::new(title, body), &bark_url).await {
+        let _ = app.emit(NOTICE_CHANNEL, format!("发送结账提醒时出错：{err}"));
+    }
+}
+
 /// 消费引擎事件：转发给前端，并在有货时发提醒。
 async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Event>) {
     while let Some(event) = events.recv().await {
@@ -1055,6 +1195,30 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
                 .try_state::<AppState>()
                 .map(|s| s.settings_snapshot())
                 .unwrap_or_default();
+            // 只有设置里选定的那件商品到货才结账。其他商品照常提醒，但不去碰下单
+            // 浏览器，免得占住结账、让选定的那件到货时反而被挡在外面。
+            // 持续有货时每一轮都会再收到到货事件；上一次结账还在进行就不再触发，
+            // 否则每一轮都会多一条「已有结账在进行」的失败提醒。
+            let checkout_busy = app
+                .try_state::<AppState>()
+                .is_some_and(|s| s.checkout.is_busy());
+            if settings.checkout.enabled && settings.is_checkout_target(target) && !checkout_busy {
+                // 结账要操作好几个页面，不能占住事件循环，否则后续提醒都会被拖住。
+                tauri::async_runtime::spawn(run_checkout_on_hit(app.clone(), target.clone()));
+            }
+            if settings.stop_on_hit {
+                // 放到独立任务里停：引擎可能正等着往这个事件通道里发下一条事件，
+                // 在这里原地等它停下会互相卡住。本轮已经发出的到货事件仍会照常处理。
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app.try_state::<AppState>()
+                        && state.watcher.is_running().await
+                    {
+                        state.watcher.stop().await;
+                        let _ = app.emit(NOTICE_CHANNEL, "监控到有货，已按设置暂停监控。");
+                    }
+                });
+            }
             let destination_url = target_open_url(&app, target, settings.open_on_hit);
             let bark_url = settings.bark_url_for(target).to_owned();
             let has_product_bark = settings.product_bark_urls.contains_key(&target.part_number);
@@ -1154,13 +1318,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "quit" => {
                 // `app.exit()` 会立即结束事件循环，不能指望托管状态的析构顺序替
                 // Chromium 收尾。先停掉可能正在查询的一轮，再显式释放浏览器树。
-                let state = app.state::<AppState>();
-                let watcher = state.watcher.clone();
-                let fetcher = state.fetcher.clone();
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    watcher.stop().await;
-                    fetcher.shutdown().await;
+                    release_browsers(&app).await;
                     app.exit(0);
                 });
             }
@@ -1312,6 +1472,7 @@ pub fn run() {
             app.manage(AppState {
                 watcher,
                 fetcher,
+                checkout: CheckoutRunner::new(),
                 catalog,
                 http: reqwest::Client::new(),
                 settings: RwLock::new(settings),
@@ -1368,12 +1529,35 @@ pub fn run() {
             retry_watching_now,
             is_running,
             test_notify,
+            open_checkout_browser,
+            test_checkout,
             open_target_product,
             check_for_update,
             install_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("Tauri 应用启动失败")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                // Dock 图标的「退出」、Cmd+Q 和应用菜单的退出都不经过托盘菜单，
+                // 系统直接结束进程。这里是所有退出方式的最后一站：不在这里收尾，
+                // 查询用的无头浏览器和下单浏览器都会留在后台。托盘退出已经清理
+                // 过一遍，再走到这里时两个会话都是空的，立即返回。
+                tauri::async_runtime::block_on(async {
+                    let _ = tokio::time::timeout(EXIT_CLEANUP_TIMEOUT, release_browsers(app)).await;
+                });
+            }
+        });
+}
+
+/// 停掉监控并关闭查询与下单两个浏览器。可以重复调用。
+async fn release_browsers(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    state.watcher.stop().await;
+    state.fetcher.shutdown().await;
+    state.checkout.shutdown().await;
 }
 
 #[cfg(test)]

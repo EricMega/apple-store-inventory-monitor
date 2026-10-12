@@ -141,6 +141,36 @@ export interface NetworkSettings {
   clash: ClashSettings;
 }
 
+/** 自动结账使用的付款方式，与 Rust 侧 `CheckoutPayment` 一一对应。 */
+export type CheckoutPayment = "alipay" | "wechat" | "installment";
+
+/** Apple 结账页提供的分期期数。 */
+export const INSTALLMENT_PERIODS = [1, 3, 6, 12, 24] as const;
+
+/** 到货后自动结账的设置。目前只支持中国大陆的直营店取货。 */
+export interface CheckoutSettings {
+  enabled: boolean;
+  /** 取货人证件号码后四位；Apple 每次结账都要求重新填写。 */
+  nationalIdSuffix: string;
+  payment: CheckoutPayment;
+  /** 分期方案名称，按结账页上的名称匹配。 */
+  installmentBank: string;
+  installmentPeriods: number;
+  /** 核对通过后是否自动点「立即下单」。 */
+  placeOrder: boolean;
+  /** 结账页默认选中的最近有货门店可取货时直接用它，不换到监控到货的那一家。 */
+  acceptNearestStore: boolean;
+  /** 要下单的商品标识（见 checkoutProductKey）。留空且只监控一件商品时自动认定为那一件。 */
+  product: string;
+  /** 是否用下面的联系信息覆盖结账页上 Apple 预填的内容。 */
+  fillContact: boolean;
+  contactLastName: string;
+  contactFirstName: string;
+  contactEmail: string;
+  /** 中国大陆手机号，不带 +86。 */
+  contactPhone: string;
+}
+
 /** 本机 Clash 线路检查结果，不代表 Apple 一定接受这些节点。 */
 export interface ClashRouteCheck {
   version: string;
@@ -185,7 +215,10 @@ export interface Settings {
   barkUrl: string;
   soundEnabled: boolean;
   openOnHit: OpenOnHit;
+  /** 监控到有货后是否暂停监控；关闭时持续有货会每轮重复提醒。 */
+  stopOnHit: boolean;
   network: NetworkSettings;
+  checkout: CheckoutSettings;
 }
 
 /** 监控目标的唯一键，与 Rust 侧 Target::key 的构成保持一致。 */

@@ -41,6 +41,7 @@ import { describeUpdateError, type UpdateProgress } from "./updateStatus";
 
 const EVENT_CHANNEL = "watcher://event";
 const NOTICE_CHANNEL = "watcher://notice";
+const SETTINGS_CHANNEL = "watcher://settings";
 const MAX_LOG_LINES = 300;
 
 export interface UiState {
@@ -89,6 +90,7 @@ const DEFAULT_SETTINGS: Settings = {
   productBarkUrls: {},
   soundEnabled: true,
   openOnHit: "bag",
+  stopOnHit: false,
   network: {
     mode: "system",
     clash: {
@@ -99,6 +101,21 @@ const DEFAULT_SETTINGS: Settings = {
       nodeFilter: "",
       pinnedNode: "DIRECT",
     },
+  },
+  checkout: {
+    enabled: false,
+    nationalIdSuffix: "",
+    payment: "alipay",
+    installmentBank: "招商银行",
+    installmentPeriods: 24,
+    placeOrder: false,
+    acceptNearestStore: false,
+    product: "",
+    fillContact: false,
+    contactLastName: "",
+    contactFirstName: "",
+    contactEmail: "",
+    contactPhone: "",
   },
 };
 
@@ -249,6 +266,9 @@ export function connect(): Promise<void> {
     unlisteners = await Promise.all([
       listen<WatcherEvent>(EVENT_CHANNEL, (e) => applyEvent(e.payload)),
       listen<string>(NOTICE_CHANNEL, (e) => pushLog(e.payload)),
+      // 后端自己改了设置（结账完成后关闭自动结账）时同步过来，否则界面上的开关
+      // 还显示开启，下一次保存会把它重新打开。
+      listen<Settings>(SETTINGS_CHANNEL, (e) => update({ settings: e.payload })),
     ]);
 
     const [regions, categories, settings, rows, running] = await Promise.all([
@@ -552,6 +572,26 @@ export async function selectClashNode(node: string): Promise<boolean> {
   } catch (err) {
     pushLog(`手动切换节点失败：${String(err)}`);
     return false;
+  }
+}
+
+/** 打开下单浏览器，供用户登录、加购并手动走一次结账。 */
+export async function openCheckoutBrowser(): Promise<void> {
+  try {
+    await invoke("open_checkout_browser");
+    pushLog("已打开下单浏览器。请在里面登录 Apple 账户，把要买的商品加入购物袋，并手动走一次结账。");
+  } catch (err) {
+    pushLog(`打开下单浏览器失败：${String(err)}`);
+  }
+}
+
+/** 试跑自动结账到「查看订单」页，不提交订单。 */
+export async function testCheckout(): Promise<void> {
+  try {
+    await settingsWrite;
+    pushLog(await invoke<string>("test_checkout"));
+  } catch (err) {
+    pushLog(`试跑自动结账没有完成：${String(err)}`);
   }
 }
 
