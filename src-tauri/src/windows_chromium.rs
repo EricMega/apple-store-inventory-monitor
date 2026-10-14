@@ -334,6 +334,30 @@ mod tests {
     };
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
+    const PROCESS_FIXTURE: &str = "windows_chromium::tests::browser_job_process_fixture";
+
+    // 用测试二进制自身建立父子关系，不依赖 cmd 的引号处理、PATH 或 ping。
+    #[test]
+    #[ignore = "仅供进程树回收测试作为子进程调用"]
+    fn browser_job_process_fixture() {
+        match std::env::var("APW_WINDOWS_JOB_FIXTURE").as_deref() {
+            Ok("parent") => {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", PROCESS_FIXTURE, "--ignored", "--nocapture"])
+                    .env("APW_WINDOWS_JOB_FIXTURE", "child")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+                child.wait().unwrap();
+            }
+            Ok("child") => std::thread::sleep(Duration::from_secs(30)),
+            _ => {}
+        }
+    }
+
     #[test]
     fn windows_command_line_preserves_profile_with_spaces() {
         let args = command_args(
@@ -349,14 +373,14 @@ mod tests {
     #[test]
     fn dropping_job_terminates_browser_like_process_tree() {
         let job = BrowserJob::new().unwrap();
-        let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        let mut child = Command::new(shell)
-            .args(["/D", "/C", "ping -n 30 127.0.0.1 > NUL"])
+        let mut stderr = tempfile::tempfile().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", PROCESS_FIXTURE, "--ignored", "--nocapture"])
+            .env("APW_WINDOWS_JOB_FIXTURE", "parent")
             .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr.try_clone().unwrap())
             .spawn()
             .unwrap();
         if let Err(error) = job.assign_and_resume(&child) {
@@ -366,6 +390,12 @@ mod tests {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         let descendant = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                stderr.seek(SeekFrom::Start(0)).unwrap();
+                let mut detail = String::new();
+                stderr.read_to_string(&mut detail).unwrap();
+                panic!("模拟浏览器父进程提前退出：{status}；{detail}");
+            }
             let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
             assert_ne!(raw, INVALID_HANDLE_VALUE);
             let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
