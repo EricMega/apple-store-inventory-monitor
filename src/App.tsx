@@ -111,7 +111,7 @@ import {
   targetKey,
 } from "@/lib/types";
 
-import { describeDelivery, describeMonitorStatus, describePickupDate, type DeliveryTone } from "@/lib/monitorLog";
+import { describeBrowserFailure, describeBrowserRecovery, describeDelivery, describeMonitorStatus, describePickupDate, type DeliveryTone } from "@/lib/monitorLog";
 import { compareNewestProducts, sortMonitorsNewestFirst } from "@/lib/productOrder";
 
 const EMPTY_DELIVERY_LOCALITIES: DeliveryLocalities = {
@@ -607,6 +607,10 @@ export default function App() {
   );
 
   const sortedRows = useMemo(() => sortMonitorsNewestFirst(ui.rows), [ui.rows]);
+  const browserFailure = describeBrowserFailure(ui.rows);
+  const browserRunningLabel = secondsUntilNextCheck !== null && secondsUntilNextCheck > 0
+    ? `浏览器未连接 · 约 ${secondsUntilNextCheck} 秒后重试`
+    : "浏览器未连接 · 正在重新连接";
 
   const targets = useMemo(() => ui.rows.map((row) => row.target), [ui.rows]);
 
@@ -703,7 +707,8 @@ export default function App() {
   async function onRetryNow() {
     setIsRetrying(true);
     try {
-      await retryWatchingNow();
+      if (ui.running) await retryWatchingNow();
+      else await startWatching();
     } finally {
       setIsRetrying(false);
     }
@@ -774,11 +779,11 @@ export default function App() {
             <div className="flex shrink-0 items-center gap-2.5">
               <div className="status-pill" role="status" aria-live="polite">
                 <span
-                  className={`size-2 rounded-full ${ui.running ? "bg-in-stock shadow-[0_0_12px_var(--in-stock)]" : "bg-muted-foreground/55"}`}
+                  className={`size-2 rounded-full ${ui.running ? browserFailure !== null ? "bg-destructive" : "bg-in-stock shadow-[0_0_12px_var(--in-stock)]" : "bg-muted-foreground/55"}`}
                   aria-hidden="true"
                 />
                 <span className="hidden text-xs text-muted-foreground sm:inline">监控状态</span>
-                <span className="text-sm font-medium">{ui.running ? runningLabel : "已暂停"}</span>
+                <span className="text-sm font-medium">{ui.running ? browserFailure !== null ? browserRunningLabel : runningLabel : "已暂停"}</span>
               </div>
               {ui.running && ui.cooling && (
                 <Button
@@ -812,7 +817,33 @@ export default function App() {
             </div>
           </header>
 
-          {ui.trouble !== null && (
+          {browserFailure !== null && (
+            <Alert variant="destructive" className="shrink-0 rounded-2xl border-destructive/25 bg-destructive/8 px-4 py-3">
+              <AlertTriangle aria-hidden="true" />
+              <AlertTitle>查询浏览器未连接</AlertTitle>
+              <AlertDescription>
+                <span>{browserFailure.split("。")[0]}。</span>
+                <span>当前库存尚未更新，请按以下步骤处理：</span>
+                <ol className="list-decimal space-y-1 pl-5">
+                  {describeBrowserRecovery(browserFailure).map((step) => <li key={step}>{step}</li>)}
+                </ol>
+                <span className="text-xs">仍无法恢复时，请把“查看详情”中的错误信息、果到雷达版本和浏览器版本通过项目的 GitHub Issues 反馈。{ui.running ? "运行中仍会按设置的间隔尝试连接。" : "当前监控已暂停。"}</span>
+                <div className="flex flex-wrap items-center gap-4">
+                  <Button variant="outline" size="sm" onClick={() => void onRetryNow()} disabled={isRetrying} aria-busy={isRetrying}>
+                    <RefreshCw className={isRetrying ? "animate-spin motion-reduce:animate-none" : undefined} aria-hidden="true" />
+                    {isRetrying ? "正在连接…" : ui.running ? "处理后重试" : "开始监控"}
+                  </Button>
+                  <details className="min-w-0 text-xs">
+                    <summary className="cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2">查看详情</summary>
+                    <p className="mt-2 break-words">{browserFailure}</p>
+                    <p className="mt-1 break-words">启动诊断（如已生成）位于查询浏览器专属目录的 browser-startup.log 中。</p>
+                  </details>
+                </div>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {ui.trouble !== null && browserFailure === null && (
             <Alert variant="destructive" className="shrink-0 rounded-2xl border-destructive/25 bg-destructive/8 px-4 py-3">
               <AlertTriangle aria-hidden="true" />
               <AlertTitle>监控结果暂不可信</AlertTitle>

@@ -11,6 +11,7 @@
  */
 
 export type UnknownReason =
+  | { reason: "browser_unavailable"; detail: string }
   | { reason: "not_yet_checked" }
   | { reason: "pickup_pending" }
   | { reason: "blocked"; detail: string }
@@ -366,6 +367,8 @@ function describeUnknown(a: { kind: "unknown" } & UnknownReason): {
       return { label: "未知", tone: "unknown", detail: `Apple 返回错误：${compactDiagnostic(a.message)}` };
     case "transport":
       return { label: "未知", tone: "unknown", detail: describeTransportFailure(a.detail) };
+    case "browser_unavailable":
+      return { label: "浏览器未连接", tone: "unknown", detail: `${compactDiagnostic(a.detail)}。当前库存尚未更新；运行中会按设置的间隔再次尝试连接。` };
     default:
       return assertNever(a);
   }

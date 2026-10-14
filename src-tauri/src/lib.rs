@@ -22,10 +22,13 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
 
+mod browser_support;
 mod checkout;
 mod chromium_fetcher;
 mod clash;
 mod route_pool;
+#[cfg(windows)]
+mod windows_chromium;
 use checkout::{CheckoutOutcome, CheckoutPlan, CheckoutRunner};
 use chromium_fetcher::AppleChromiumFetcher;
 
@@ -1419,6 +1422,13 @@ fn load_settings(notices: &mut Vec<String>) -> (Settings, Option<SettingsStore>)
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
