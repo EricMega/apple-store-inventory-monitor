@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+use crate::browser_support::startup_exit_detail;
 use crate::clash::ClashController;
 use crate::route_pool::RoutePool;
 
@@ -60,10 +61,16 @@ struct ChromiumProcess {
     child: Child,
     /// Unix 下为 Chromium 独立进程组的 ID；退出时必须清理整个多进程树。
     process_group_id: Option<u32>,
+    #[cfg(windows)]
+    job: Option<crate::windows_chromium::BrowserJob>,
 }
 
 impl Drop for ChromiumProcess {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
         terminate_chromium(&mut self.child, self.process_group_id);
     }
 }
@@ -198,9 +205,66 @@ fn reclaim_orphaned_profile_process(profile_dir: &Path) -> Result<(), ApiError> 
     ))
 }
 
-#[cfg(not(unix))]
-fn reclaim_orphaned_profile_process(_profile_dir: &Path) -> Result<(), ApiError> {
-    Ok(())
+#[cfg(windows)]
+fn reclaim_orphaned_profile_process(profile_dir: &Path) -> Result<(), ApiError> {
+    crate::windows_chromium::reclaim_orphaned_profile_process(profile_dir)
+}
+
+/// 持续排空 stderr，最多保留启动阶段的 16 KiB，避免管道堵塞或日志无限增长。
+fn capture_startup_output(child: &mut Child, output: Arc<std::sync::Mutex<Vec<u8>>>) {
+    if let Some(mut stderr) = child.stderr.take() {
+        let captured = output.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0; 1024];
+            while let Ok(count) = stderr.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                if let Ok(mut bytes) = captured.lock() {
+                    let retained = count.min((16 * 1024usize).saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&buffer[..retained]);
+                }
+            }
+        });
+    }
+}
+
+fn startup_output(output: &std::sync::Mutex<Vec<u8>>) -> String {
+    output
+        .lock()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+fn save_startup_diagnostic(profile: &Path, browser: &Path, mode: &str, result: &str, stderr: &str) {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // 只保留最近一次启动；不保存命令行、Cookie、账户资料，也不上传诊断。
+    let sanitized = stderr
+        .replace(profile.to_string_lossy().as_ref(), "[专属资料目录]")
+        .replace(browser.to_string_lossy().as_ref(), "[浏览器]");
+    #[cfg(windows)]
+    let version =
+        crate::windows_chromium::browser_file_version(browser).unwrap_or_else(|| "未取得".into());
+    #[cfg(not(windows))]
+    let version = result
+        .strip_prefix("已连接，版本 ")
+        .unwrap_or("未取得")
+        .to_string();
+    if let Ok(mut file) = options.open(profile.join("browser-startup.log")) {
+        let _ = writeln!(
+            file,
+            "browser={}\nversion={version}\nmode={mode}\nresult={result}\n{sanitized}",
+            browser.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
 }
 
 /// 查询浏览器的网络启动参数。
@@ -423,11 +487,43 @@ impl ChromiumSession {
         headless: bool,
     ) -> Result<Self, ApiError> {
         let chrome = find_chromium().ok_or_else(|| {
-            ApiError::Transport(
-                "未找到 Google Chrome 或 Microsoft Edge；Apple 当前库存接口要求完整 Chromium 浏览器会话"
-                    .into(),
+            ApiError::BrowserUnavailable(
+                "未找到 Google Chrome 或 Microsoft Edge，请安装受支持的浏览器后重试".into(),
             )
         })?;
+        let startup = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = Self::launch_inner(
+            profile_dir.clone(),
+            chrome.clone(),
+            network_args,
+            headless,
+            startup.clone(),
+        )
+        .await;
+        if let Err(error) = &result {
+            save_startup_diagnostic(
+                &profile_dir,
+                &chrome,
+                if headless { "headless" } else { "visible" },
+                &error.to_string(),
+                &startup_output(&startup),
+            );
+        }
+        result.map_err(|error| {
+            ApiError::BrowserUnavailable(match error {
+                ApiError::Transport(detail) => detail,
+                other => other.to_string(),
+            })
+        })
+    }
+
+    async fn launch_inner(
+        profile_dir: PathBuf,
+        chrome: PathBuf,
+        network_args: &[String],
+        headless: bool,
+        startup: Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> Result<Self, ApiError> {
         let is_edge = chrome
             .to_string_lossy()
             .to_ascii_lowercase()
@@ -447,7 +543,7 @@ impl ChromiumSession {
             profile_dir.display(),
             if headless { "headless" } else { "visible" }
         );
-        let mut command = Command::new(chrome);
+        let mut command = Command::new(&chrome);
         command
             .args([
                 "--remote-debugging-address=127.0.0.1",
@@ -457,10 +553,12 @@ impl ChromiumSession {
                 "--no-default-browser-check",
                 "--disable-sync",
                 "--disable-default-apps",
+                "--enable-logging=stderr",
+                "--log-level=2",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // 无头模式：不出现窗口和 Dock 图标，也不会抢焦点。无头浏览器的破绽由
         // 启动后的 UA 与 Client Hints 覆盖补上，见 `apply_browser_identity`。
         if headless {
@@ -478,6 +576,13 @@ impl ChromiumSession {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+            command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+            crate::windows_chromium::BrowserJob::new()?
+        };
         let child = command
             .spawn()
             .map_err(|e| ApiError::Transport(format!("无法启动 Chromium：{e}")))?;
@@ -489,7 +594,16 @@ impl ChromiumSession {
         let mut process = ChromiumProcess {
             child,
             process_group_id,
+            #[cfg(windows)]
+            job: Some(job),
         };
+        capture_startup_output(&mut process.child, startup.clone());
+        #[cfg(windows)]
+        process
+            .job
+            .as_ref()
+            .expect("浏览器启动前应已建立 Job")
+            .assign_and_resume(&process.child)?;
 
         let deadline = Instant::now() + CHROME_START_TIMEOUT;
         let targets_url = format!("http://127.0.0.1:{debug_port}/json/list");
@@ -499,9 +613,9 @@ impl ChromiumSession {
                 .try_wait()
                 .map_err(|e| ApiError::Transport(format!("无法检查 Chromium 状态：{e}")))?
             {
-                return Err(ApiError::Transport(format!(
-                    "Chromium 启动后立即退出：{status}"
-                )));
+                let stderr = startup_output(&startup);
+                let detail = startup_exit_detail(status.code(), &stderr);
+                return Err(ApiError::Transport(detail));
             }
             if Instant::now() >= deadline {
                 return Err(ApiError::Transport("等待 Chromium 启动超时".into()));
@@ -535,11 +649,25 @@ impl ChromiumSession {
             established,
         };
         if !headless {
+            save_startup_diagnostic(
+                &session.profile_dir,
+                &chrome,
+                "visible",
+                "已连接",
+                &startup_output(&startup),
+            );
             return Ok(session);
         }
         let version = session.command("Browser.getVersion", json!({})).await?;
         let identity = BrowserIdentity::from_version(&version, is_edge)
             .ok_or_else(|| ApiError::Transport("无法读取 Chromium 版本信息".into()))?;
+        save_startup_diagnostic(
+            &session.profile_dir,
+            &chrome,
+            "headless",
+            &format!("已连接，版本 {}", identity.full_version),
+            &startup_output(&startup),
+        );
         session
             .command("Emulation.setUserAgentOverride", identity.override_params())
             .await?;
@@ -1940,7 +2068,7 @@ impl AppleChromiumFetcher {
             return Err(error);
         }
         if let Some(detail) = guard.session_start_failure.clone() {
-            return Err(ApiError::Transport(detail));
+            return Err(ApiError::BrowserUnavailable(detail));
         }
         let nearby_unavailable = cache_key
             .as_ref()
@@ -1966,7 +2094,9 @@ impl AppleChromiumFetcher {
                     Ok(session) => guard.session = Some(session),
                     Err(error) => {
                         let detail = match &error {
-                            ApiError::Transport(detail) => detail.clone(),
+                            ApiError::Transport(detail) | ApiError::BrowserUnavailable(detail) => {
+                                detail.clone()
+                            }
                             _ => error.to_string(),
                         };
                         guard.session_start_failure = Some(detail);
@@ -2350,6 +2480,8 @@ mod tests {
         let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
         let session = ChromiumSession {
             _process: ChromiumProcess {
+                #[cfg(windows)]
+                job: None,
                 child: Command::new("rustc")
                     .arg("--version")
                     .stdout(Stdio::null())
@@ -2688,12 +2820,49 @@ mod tests {
 
         drop(session);
 
-        let result = unsafe { libc::kill(-(process_group_id as i32), 0) };
-        assert_eq!(result, -1, "Chromium 进程组不应在会话析构后残留");
+        // macOS 的进程保护可能让 kill(..., 0) 返回 EPERM，即使进程已消失。
+        // 直接检查进程组成员，并给系统有界时间回收已结束的子进程。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = Command::new("ps").args(["-axo", "pgid="]).output().unwrap();
+            assert!(output.status.success());
+            let remains = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .any(|group| group == process_group_id);
+            if !remains {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Chromium 进程组不应在会话析构后残留"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "需要 Windows Chrome/Edge，仅启动 about:blank，不访问 Apple"]
+    async fn 真实windows浏览器会话能启动并回收() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let profile = tempfile::tempdir().unwrap();
+        let session = ChromiumSession::start(profile.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(session._process.job.is_some());
+        drop(session);
+        // 析构已经 wait() 主进程；再通过新会话验证目录锁也已释放。
+        let session = ChromiumSession::start(profile.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(session._process.job.is_some());
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            unsafe { WaitForSingleObject(session._process.child.as_raw_handle(), 0) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT
         );
+        drop(session);
     }
 
     #[tokio::test]

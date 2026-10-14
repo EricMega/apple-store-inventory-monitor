@@ -35,7 +35,7 @@ import type {
   WatcherEvent,
 } from "./types";
 import { assertNever, targetKey } from "./types";
-import { describeCycleRow, describeCycleSummary } from "./monitorLog";
+import { describeBrowserFailure, describeCycleRows, describeCycleSummary } from "./monitorLog";
 
 import { describeUpdateError, type UpdateProgress } from "./updateStatus";
 
@@ -207,6 +207,7 @@ function applyEvent(event: WatcherEvent): void {
 
     case "cycleComplete": {
       const recovered = event.healthy && state.trouble !== null;
+      const previousBrowserFailure = describeBrowserFailure(state.rows);
       update({
         rows: event.snapshot,
         nextCheckAtMs: Date.now() + event.nextCheckInSecs * 1_000,
@@ -216,7 +217,10 @@ function applyEvent(event: WatcherEvent): void {
         // 不可靠的：某些故障路径下状态压根没被更新。
         trouble: event.healthy ? null : state.trouble,
       });
-      const lines = event.snapshot.map((row) => describeCycleRow(event.cycle, row));
+      const lines = describeCycleRows(event.cycle, event.snapshot, previousBrowserFailure);
+      if (previousBrowserFailure !== null && event.requestCount > 0 && describeBrowserFailure(event.snapshot) === null) {
+        lines.unshift("浏览器启动故障已解除。");
+      }
       if (recovered) lines.unshift("查询已恢复正常。");
       lines.push(
         `第 ${event.cycle} 轮完成（${formatElapsed(event.elapsedMs)}，实际请求 ${event.requestCount} 次` +
