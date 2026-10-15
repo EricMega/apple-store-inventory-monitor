@@ -1074,7 +1074,7 @@ async fn test_checkout(
         .iter()
         .find(|target| settings.is_checkout_target(target))
         .ok_or("试跑需要先确定要下单的商品：监控列表里要有它的中国大陆监控项，有多件商品时请在自动结账里选一件")?;
-    let plan = CheckoutPlan::new(target, &settings, false);
+    let plan = CheckoutPlan::new(target, &settings, &state.catalog, false);
     let progress = move |message: String| {
         let _ = app.emit(NOTICE_CHANNEL, message);
     };
@@ -1107,7 +1107,12 @@ async fn run_checkout_on_hit(app: AppHandle, target: Target) {
         );
         return;
     }
-    let plan = CheckoutPlan::new(&target, &settings, settings.checkout.place_order);
+    let plan = CheckoutPlan::new(
+        &target,
+        &settings,
+        &state.catalog,
+        settings.checkout.place_order,
+    );
     let progress = {
         let app = app.clone();
         move |message: String| {
