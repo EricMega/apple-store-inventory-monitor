@@ -1,13 +1,13 @@
 # 果到雷达
 
 [![CI](https://github.com/suversal/apple-store-inventory-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/suversal/apple-store-inventory-monitor/actions/workflows/ci.yml)
-[![源码版本: v1.0.21](https://img.shields.io/badge/source-v1.0.21-blue)](package.json)
+[![源码版本: v1.0.22](https://img.shields.io/badge/source-v1.0.22-blue)](package.json)
 [下载与发布记录](https://github.com/suversal/apple-store-inventory-monitor/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
 果到雷达是一款 Apple 直营店取货库存监控工具。选好地区、门店和具体型号后，它会定时检查库存；检测到有货时，可以播放提示音、推送 Bark，并按你的选择打开 Apple 购物袋或商品详情。中国大陆直营店取货还可以开启[自动结账](#自动结账可选)：到货后由应用自己的浏览器走完结账页面，停在「查看订单」页等你确认。
 
-支持 macOS、Windows 和 Linux，使用 Rust、Tauri 2 和 React 编写。果到雷达的正式版本从 **1.0.0** 开始，本 README 对应 `1.0.21` 源码。应用名称为 **果到雷达**，仓库名为 `apple-store-inventory-monitor`。
+支持 macOS、Windows 和 Linux，使用 Rust、Tauri 2 和 React 编写。果到雷达的正式版本从 **1.0.0** 开始，本 README 对应 `1.0.22` 源码。应用名称为 **果到雷达**，仓库名为 `apple-store-inventory-monitor`。
 
 基于 [ENCHIGO/apple-pickup-watcher v0.3.2](https://github.com/ENCHIGO/apple-pickup-watcher/tree/v0.3.2) 继续开发，按 GPL-3.0-or-later 发布。来源与修改记录见 [NOTICE](NOTICE)。
 
@@ -84,7 +84,7 @@ Apple 可能限流或调整接口，库存也可能在提醒后立即变化。�
 1. 打开 `.dmg`，把 `果到雷达.app` 拖进「应用程序」，不要直接在磁盘映像中长期运行。
 2. 应用包已经过完整的 ad-hoc 签名，但暂未使用 Developer ID 证书，也未经过 Apple 公证。如果系统提示无法验证开发者，可以在 Finder 中按住 Control 点击应用并选择「打开」，或到「系统设置 → 隐私与安全性」确认被拦截的是本应用，再选择「仍要打开」。
 
-`v1.0.2` 的 macOS 包曾因应用签名不完整而被系统误报为“已损坏”，此问题已在 `v1.0.3` 修复。如果新版仍显示旧提示，请先删除旧应用和旧 DMG，确认重新下载的文件名包含 `1.0.21`。确认安装包来自本仓库 Release 后，仍可执行：
+`v1.0.2` 的 macOS 包曾因应用签名不完整而被系统误报为“已损坏”，此问题已在 `v1.0.3` 修复。如果新版仍显示旧提示，请先删除旧应用和旧 DMG，确认重新下载的文件名包含 `1.0.22`。确认安装包来自本仓库 Release 后，仍可执行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/果到雷达.app"
@@ -105,7 +105,7 @@ Release 提供 x64 的 `.deb` 和 `.AppImage`。安装包在 Ubuntu 24.04 上构
 **Debian / Ubuntu：**
 
 ```bash
-sudo apt install "./apple-store-inventory-monitor_1.0.21_amd64.deb"
+sudo apt install "./apple-store-inventory-monitor_1.0.22_amd64.deb"
 ```
 
 `apt` 会同时安装包声明的依赖。音频播放和托盘还需要 ALSA 与 AppIndicator 运行库。
@@ -113,14 +113,14 @@ sudo apt install "./apple-store-inventory-monitor_1.0.21_amd64.deb"
 **AppImage：**
 
 ```bash
-chmod +x "./apple-store-inventory-monitor_1.0.21_amd64.AppImage"
-"./apple-store-inventory-monitor_1.0.21_amd64.AppImage"
+chmod +x "./apple-store-inventory-monitor_1.0.22_amd64.AppImage"
+"./apple-store-inventory-monitor_1.0.22_amd64.AppImage"
 ```
 
 AppImage 需要 FUSE 2。Ubuntu 24.04 可以用 `sudo apt install libfuse2t64` 安装；也可以不安装 FUSE，直接解包运行：
 
 ```bash
-"./apple-store-inventory-monitor_1.0.21_amd64.AppImage" --appimage-extract-and-run
+"./apple-store-inventory-monitor_1.0.22_amd64.AppImage" --appimage-extract-and-run
 ```
 
 Linux 还需要自行安装 Chrome、Edge 或 Chromium。使用 Chromium 时，请确认终端可以运行 `chromium` 或 `chromium-browser`。
@@ -317,7 +317,9 @@ Apple 返回 `403`、`541` 或 `429` 时，处理方式取决于「查询线路�
 
 #### 取货门店怎么选
 
-进入结账页并切换到「我要取货」后，Apple 会默认选中一家离你最近的有货门店。换成另一家门店需要再等 Apple 响应一次，大约多花十几秒。
+进入结账页并切换到「我要取货」后，应用会沿用已有的目标门店列表或符合设置的默认门店。官网尚未设置取货地区，或列表里没有目标门店及可接受的默认门店时，会根据目标门店的省、市和公开地址补齐取货地区，再查询门店；无法唯一匹配时停下并提示手动选择。这一步不需要浏览器定位权限。
+
+Apple 可能默认选中取货地区附近的一家有货门店。换成另一家门店需要再等 Apple 响应一次，大约多花十几秒。
 
 - **关闭「优先用结账页默认选中的门店」（默认）**：只在监控到货的门店取货。如果 Apple 默认选中的门店恰好也在这件商品的监控列表里并且可取货，就直接用它；否则改选到货的那一家。
 - **打开**：只要 Apple 默认选中的门店可以取货，就直接在那里取货，即使它不是监控到货的那一家。速度更快，但取货地点可能不是你监控的门店。
@@ -677,7 +679,7 @@ macOS 应用包使用完整的 ad-hoc 签名，但没有 Developer ID 证书且�
 
 下面只比较本项目与直接上游 `ENCHIGO/apple-pickup-watcher v0.3.2` 的差异。Rust、Tauri、三态库存、四个产品品类、系统托盘和应用内更新等能力已经由上游完成，不算作本项目新增。
 
-| 项目 | 直接上游 v0.3.2 | 果到雷达 v1.0.21 |
+| 项目 | 直接上游 v0.3.2 | 果到雷达 v1.0.22 |
 | --- | --- | --- |
 | Apple 查询会话 | 普通 HTTP 客户端先访问商品页获取 Cookie，再查询库存 | 启动应用专属的持久 Chromium 会话，在 Apple 页面环境中完成校验和库存请求；同轮对被拦截地区停止重复请求，下轮按用户设置的间隔重试 |
 | 批量添加监控 | 每次选择一家门店和一个型号 | 门店、型号都可以多选，一次生成全部组合；重复组合会自动跳过 |
@@ -827,7 +829,7 @@ pnpm tauri build --no-sign
 
 产物位于 `target/release/bundle/`。自动更新包需要仓库维护者配置 `TAURI_SIGNING_PRIVATE_KEY`；私钥设置了密码时还要配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。没有私钥时不能生成可被现有客户端验证的更新签名。
 
-正式版本由 [Release 工作流](.github/workflows/release.yml) 构建，标签使用 `v1.0.21` 这样的格式。发版前应确认 `package.json`、工作区 `Cargo.toml`、`src-tauri/tauri.conf.json` 与标签的版本一致。macOS 专用配置在 `src-tauri/tauri.macos.conf.json` 中启用 ad-hoc 签名；发布流水线会同时验证自动更新归档和 DMG 内的应用签名。
+正式版本由 [Release 工作流](.github/workflows/release.yml) 构建，标签使用 `v1.0.22` 这样的格式。发版前应确认 `package.json`、工作区 `Cargo.toml`、`src-tauri/tauri.conf.json` 与标签的版本一致。macOS 专用配置在 `src-tauri/tauri.macos.conf.json` 中启用 ad-hoc 签名；发布流水线会同时验证自动更新归档和 DMG 内的应用签名。
 
 推送 `v*` 标签后，GitHub Actions 会生成 macOS、Windows 和 Linux 安装包，并先创建草稿 Release；确认四个平台全部成功后再公开发布，避免用户下载到缺少部分平台或 `latest.json` 尚未完整生成的版本。手动运行 `workflow_dispatch` 只生成 Actions 构建产物，不会创建公开 Release。
 
