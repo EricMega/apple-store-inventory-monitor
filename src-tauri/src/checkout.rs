@@ -216,10 +216,11 @@ fn normalized_name(name: &str) -> String {
         .collect()
 }
 
-/// 购物袋必须恰好是到货的那一件商品。
+/// 购物袋和订单确认页必须只有目标商品。
 ///
-/// 宁可拒绝也不放宽：多一件商品、数量不是 1、或型号对不上，继续下去买到的
-/// 就不是用户监控的东西。
+/// 宁可拒绝也不放宽：多一件商品、已知数量不是 1、或型号对不上都会停下。
+/// 订单确认页可能不显示数量，因此这里容许数量为空；只有购物袋阶段已明确
+/// 核实数量为 1，才能走到订单确认页（见 verify_bag_items）。
 fn verify_items(items: &[LineItem], product_name: &str) -> Result<(), String> {
     let [item] = items else {
         return Err(if items.is_empty() {
@@ -241,6 +242,16 @@ fn verify_items(items: &[LineItem], product_name: &str) -> Result<(), String> {
     let quantity = item.quantity.trim();
     if !quantity.is_empty() && quantity != "1" {
         return Err(format!("购物袋里的数量是 {quantity}，自动结账只买 1 件"));
+    }
+    Ok(())
+}
+
+/// 购物袋阶段必须读到明确的数量 1；不能把页面解析失败当作数量正确。
+/// 订单确认页可能隐藏数量控件，但调用它之前必须先通过本检查。
+fn verify_bag_items(items: &[LineItem], product_name: &str) -> Result<(), String> {
+    verify_items(items, product_name)?;
+    if items[0].quantity.trim().is_empty() {
+        return Err("无法从购物袋确认商品数量，已停止自动结账；请手动确认数量为 1 件".into());
     }
     Ok(())
 }
@@ -643,7 +654,7 @@ impl Flow<'_> {
                     "购物袋里没有可结账的商品，请先在下单浏览器里登录并把商品加入购物袋",
                 )
             })?;
-        verify_items(&lines.items, &self.plan.product_name)
+        verify_bag_items(&lines.items, &self.plan.product_name)
             .map_err(|message| CheckoutError::new(Stage::Bag, message))?;
         self.click(Stage::Bag, r#"button[data-autom="checkout"]"#, "结账")
             .await?;
@@ -1342,6 +1353,20 @@ mod tests {
             verify_items(&unknown_quantity, "iPhone 18 Pro 256GB 冰川蓝色"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn 购物袋数量未知时拒绝下单但允许订单确认页显示为空() {
+        let product = "iPhone 18 Pro 256GB 冰川蓝色";
+        let unknown = [item(product, "")];
+        assert_eq!(verify_items(&unknown, product), Ok(()));
+        assert!(verify_bag_items(&unknown, product).is_err());
+
+        let known = [item(product, "1")];
+        assert_eq!(verify_bag_items(&known, product), Ok(()));
+
+        let wrong = [item(product, "2")];
+        assert!(verify_bag_items(&wrong, product).is_err());
     }
 
     #[test]
