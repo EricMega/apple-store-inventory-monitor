@@ -1365,8 +1365,17 @@ mod tests {
         let known = [item(product, "1")];
         assert_eq!(verify_bag_items(&known, product), Ok(()));
 
-        let wrong = [item(product, "2")];
-        assert!(verify_bag_items(&wrong, product).is_err());
+        // 无效、空白、非一件都必须在购物袋阶段拒绝。
+        for quantity in [" ", "0", "2", "3", "NaN"] {
+            let invalid = [item(product, quantity)];
+            assert!(
+                verify_bag_items(&invalid, product).is_err(),
+                "购物袋数量 {quantity:?} 不应该通过校验"
+            );
+        }
+
+        let whitespace_one = [item(product, " 1 ")];
+        assert_eq!(verify_bag_items(&whitespace_one, product), Ok(()));
     }
 
     #[test]
