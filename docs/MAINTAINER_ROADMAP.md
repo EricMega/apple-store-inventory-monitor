@@ -17,14 +17,14 @@
 | 任务 | 目标 | 验收 |
 | --- | --- | --- |
 | 购物袋数量确定性 | 购物袋无法确认数量为 1 时终止，查看订单页可沿用此前严格核对 | 未知数量拒绝、1 件通过、2 件拒绝的自动化测试（PR #1） |
-| 提交前防误购 | 商品型号/SKU、数量、门店、最高总金额独立核对，任一未知值拒绝 | 模拟不同 SKU、门店、金额和页面结构变化 |
-| 持久化防重复订单 | 提交前写入意图锁，重启后 `UNKNOWN` 不再自动提交，人工核对后解锁 | 点击前后、返回前后、落盘前的崩溃注入测试 |
-| 库存结果可信度 | `IN_STOCK`、`OUT_OF_STOCK`、`UNKNOWN/BLOCKED/STALE` 分开处理，仅确切且及时的有货结果触发结账 | 403/429/503/541、缺 SKU/门店、缓存过期、未授权页面等 fixture 测试 |
+| 提交前防误购（[#4](https://github.com/EricMega/apple-store-inventory-monitor/issues/4)） | 商品型号/SKU、数量、门店、最高总金额独立核对，任一未知值拒绝 | 模拟不同 SKU、门店、金额和页面结构变化 |
+| 持久化防重复订单（[#3](https://github.com/EricMega/apple-store-inventory-monitor/issues/3)） | 提交前写入意图锁，重启后 `UNKNOWN` 不再自动提交，人工核对后解锁 | 点击前后、返回前后、落盘前的崩溃注入测试 |
+| 现有三态可信度审计（[#5](https://github.com/EricMega/apple-store-inventory-monitor/issues/5)） | 保留上游 `InStock / OutOfStock / Unknown` 模型和退避，重点审查本轮数据新鲜度、响应覆盖与错误触发路径 | 403/429/503/541、缺 SKU/门店、缓存过期等 fixture 测试 |
 
 ## P1（稳定性和安全加固）
 
-1. **端到端演练**：以脱敏的 Apple 页面 fixture 执行从库存事件到查看订单的完整流程；手工 macOS VM 试跑需记录平台与版本。
-2. **无人值守健康检查**：查询成功时间、连续错误、Chromium 重启、Bark 投递失败等事件记录，并采用去重告警；重启只自动恢复库存监控。
+1. **端到端演练（[#7](https://github.com/EricMega/apple-store-inventory-monitor/issues/7)）**：以脱敏的 Apple 页面 fixture 执行从库存事件到查看订单的完整流程；手工 macOS VM 试跑需记录平台与版本。
+2. **无人值守健康检查（[#6](https://github.com/EricMega/apple-store-inventory-monitor/issues/6)）**：查询成功时间、连续错误、Chromium 重启、Bark 投递失败等事件记录，并采用去重告警；重启只自动恢复库存监控。
 3. **Chromium 调试端口**：保持回环地址、随机端口；进一步审查本机其他进程可访问的风险，必要时限制持久登录会话的生命周期。
 4. **配置/日志保密**：测试权限 700/600、日志脱敏、分离诊断输出；优先本地加密存储适合保密的数据。
 5. **发布和 CI 门禁**：Rust fmt/clippy/test、TypeScript/前端测试、多平台打包；固定可复现依赖、验证更新签名与工件来源。
